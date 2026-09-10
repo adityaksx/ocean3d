@@ -72,8 +72,8 @@ def bathy(nc):
  if arr.size>MAX_GRID_POINTS:
   f=int(np.ceil(np.sqrt(arr.size/MAX_GRID_POINTS)));arr=arr[::f,::f];lat=lat[::f];lon=lon[::f]
  dep=np.where(arr<0,-arr/1000,np.nan).astype(np.float32)
- # JSON does not support NaN. Null cells are intentionally used for land/no-data.
- dep_json=np.where(np.isfinite(dep),dep,None).tolist()
+ # JSON has no NaN literal. Build Python lists explicitly so invalid cells become null.
+ dep_json=[[None if not np.isfinite(v) else float(v) for v in row] for row in dep]
  xx,yy=xy(lon,lat);return xx.tolist(),yy.tolist(),dep_json,float(np.nanmax(dep))
 def prepare(data_dir):
  d=Path(data_dir);z={'coast':find_zip(d,'ne_10m_coastline.zip','coastline'),'land':find_zip(d,'ne_10m_land.zip','ne_10m_land'),'islands':find_zip(d,'ne_10m_minor_islands.zip','minor_islands'),'eez':find_zip(d,'World_EEZ_v12_20231025_LR.zip','World_EEZ'),'gebco':find_zip(d,'GEBCO_10_Sep_2026_c6ae0e7b7408.zip','GEBCO')}
