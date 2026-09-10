@@ -11,7 +11,6 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'hi
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.setClearColor(0xeaf0f3, 1);
 $('app').appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -42,17 +41,6 @@ let geometryData;
 let center = { x: 0, y: 0, size: 1000 };
 let depthExaggeration = 55;
 
-function clear(group) {
-  while (group.children.length) {
-    const object = group.children.pop();
-    object.traverse(child => {
-      child.geometry?.dispose();
-      if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
-      else child.material?.dispose();
-    });
-  }
-}
-
 function status(text, type = 'ok') {
   const el = $('status');
   const dot = $('statusDot');
@@ -75,6 +63,7 @@ function addSeabed() {
   const nx = x.length, ny = y.length;
   const positions = new Float32Array(nx * ny * 3);
   const indices = [];
+
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       const k = j * nx + i;
@@ -83,6 +72,7 @@ function addSeabed() {
       positions[3*k+2] = finite(raw[j][i]) ? -raw[j][i] * depthExaggeration : -2;
     }
   }
+
   for (let j = 0; j < ny-1; j++) {
     for (let i = 0; i < nx-1; i++) {
       const q = [raw[j][i], raw[j][i+1], raw[j+1][i], raw[j+1][i+1]];
@@ -91,153 +81,231 @@ function addSeabed() {
       indices.push(a,c,b,b,c,d);
     }
   }
+
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   g.setIndex(indices);
   g.computeVertexNormals();
   seabedGroup.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({
-    color: 0x76573f, roughness: 0.98, metalness: 0, side: THREE.DoubleSide
+    color: 0x76573f,
+    roughness: 0.98,
+    metalness: 0,
+    side: THREE.DoubleSide
   })));
 }
 
 function addWater(minX, maxX, minY, maxY) {
-  const width = maxX-minX, height = maxY-minY, z = 3;
+  const width = maxX - minX;
+  const height = maxY - minY;
   const surface = new THREE.Mesh(
     new THREE.PlaneGeometry(width, height),
     new THREE.MeshPhysicalMaterial({
-      color: 0x167fb5, transparent: true, opacity: 0.34,
-      roughness: 0.12, clearcoat: 0.5, clearcoatRoughness: 0.15,
-      side: THREE.DoubleSide, depthWrite: false
+      color: 0x167fb5,
+      transparent: true,
+      opacity: 0.36,
+      roughness: 0.12,
+      clearcoat: 0.5,
+      clearcoatRoughness: 0.15,
+      side: THREE.DoubleSide,
+      depthWrite: false
     })
   );
-  surface.position.set(center.x, center.y, z);
+  surface.position.set(center.x, center.y, 3);
   surface.renderOrder = 5;
   waterGroup.add(surface);
 
-  const sliceMaterial = new THREE.MeshBasicMaterial({
-    color: 0x126f9f, transparent: true, opacity: 0.025,
-    side: THREE.DoubleSide, depthWrite: false
-  });
-  for (let i = 1; i <= 8; i++) {
-    const slice = new THREE.Mesh(new THREE.PlaneGeometry(width, height), sliceMaterial.clone());
-    slice.material.opacity = 0.012 + i*0.002;
-    slice.position.set(center.x, center.y, z-i*18);
-    slice.renderOrder = 4-i;
+  // A few inexpensive transparent planes give the ocean real volume.
+  for (let i = 1; i <= 7; i++) {
+    const slice = new THREE.Mesh(
+      new THREE.PlaneGeometry(width, height),
+      new THREE.MeshBasicMaterial({
+        color: 0x126f9f,
+        transparent: true,
+        opacity: 0.012 + i * 0.002,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      })
+    );
+    slice.position.set(center.x, center.y, 3 - i * 18);
+    slice.renderOrder = 4 - i;
     waterGroup.add(slice);
   }
 }
 
-function makeLandShape(points) {
-  if (!Array.isArray(points) || points.length < 3) return null;
-  const shape = new THREE.Shape();
-  const stride = points.length > 1800 ? Math.ceil(points.length/1800) : 1;
-  let started = false;
-  for (let i=0; i<points.length; i+=stride) {
-    const p = points[i];
-    if (!Array.isArray(p) || !finite(+p[0]) || !finite(+p[1])) continue;
-    if (!started) { shape.moveTo(+p[0], +p[1]); started = true; }
-    else shape.lineTo(+p[0], +p[1]);
-  }
-  if (!started) return null;
-  shape.closePath();
-  return shape;
-}
+// IMPORTANT: do not create one ExtrudeGeometry/ShapeGeometry per polygon.
+// Natural Earth contains many vertices; doing that blocks the browser for a
+// long time. The backend already gives us triangulated land, so merge it into
+// ONE GPU mesh instead.
+function addLand() {
+  const polygons = [
+    ...(geometryData.land?.polygons || []),
+    ...(geometryData.islands?.polygons || [])
+  ];
 
-function addLandPolygon(p) {
-  const shape = makeLandShape(p.top);
-  if (!shape) return false;
-  const geometry = new THREE.ExtrudeGeometry(shape, {
-    depth: 3.5, bevelEnabled: false, curveSegments: 1, steps: 1
+  const positions = [];
+  const indices = [];
+  let vertexOffset = 0;
+  let rendered = 0;
+
+  for (const p of polygons) {
+    if (!Array.isArray(p.vertices) || !Array.isArray(p.triangles)) continue;
+    if (p.vertices.length < 3 || p.triangles.length === 0) continue;
+
+    for (const q of p.vertices) {
+      if (!Array.isArray(q) || !finite(+q[0]) || !finite(+q[1])) continue;
+      positions.push(+q[0], +q[1], 14);
+    }
+
+    for (const tri of p.triangles) {
+      if (!Array.isArray(tri) || tri.length < 3) continue;
+      indices.push(
+        vertexOffset + (+tri[0]),
+        vertexOffset + (+tri[1]),
+        vertexOffset + (+tri[2])
+      );
+    }
+
+    vertexOffset += p.vertices.length;
+    rendered++;
+  }
+
+  if (!positions.length || !indices.length) {
+    status(`No land triangles found · ${polygons.length} polygons`, 'error');
+    return 0;
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  g.setIndex(indices);
+  g.computeVertexNormals();
+
+  const material = new THREE.MeshBasicMaterial({
+    color: 0x3f9b55,
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false
   });
-  geometry.translate(0, 0, 10);
-  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
-    color: 0x3f9851, roughness: 0.92, metalness: 0,
-    side: THREE.DoubleSide, depthTest: false, depthWrite: false
-  }));
+
+  const mesh = new THREE.Mesh(g, material);
   mesh.renderOrder = 100;
   landGroup.add(mesh);
 
-  if (Array.isArray(p.vertices) && Array.isArray(p.triangles) && p.vertices.length >= 3 && p.triangles.length) {
-    const pos = new Float32Array(p.vertices.length*3);
-    p.vertices.forEach((q,i)=>{pos[3*i]=+q[0];pos[3*i+1]=+q[1];pos[3*i+2]=13.6;});
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(pos,3));
-    g.setIndex(p.triangles.flat());
-    const flat = new THREE.Mesh(g,new THREE.MeshBasicMaterial({
-      color:0x4ba75a,side:THREE.DoubleSide,depthTest:false,depthWrite:false
-    }));
-    flat.renderOrder = 110;
-    landGroup.add(flat);
-  }
-  return true;
+  return rendered;
 }
 
 function addLines(group, parts, z, color, order) {
-  const material = new THREE.LineBasicMaterial({color,depthTest:false,depthWrite:false});
+  const material = new THREE.LineBasicMaterial({
+    color,
+    depthTest: false,
+    depthWrite: false
+  });
   for (const part of parts || []) {
     if (!Array.isArray(part) || part.length < 2) continue;
-    const g = new THREE.BufferGeometry().setFromPoints(part.map(p=>new THREE.Vector3(+p[0],+p[1],z)));
-    const line = new THREE.Line(g,material);
+    const points = part.map(p => new THREE.Vector3(+p[0], +p[1], z));
+    const g = new THREE.BufferGeometry().setFromPoints(points);
+    const line = new THREE.Line(g, material);
     line.renderOrder = order;
     group.add(line);
   }
 }
 
 function buildScene() {
-  clear(seabedGroup); clear(waterGroup); clear(landGroup); clear(coastGroup); clear(eezGroup);
   const t = geometryData.terrain;
-  const minX=Math.min(...t.x), maxX=Math.max(...t.x), minY=Math.min(...t.y), maxY=Math.max(...t.y);
-  center={x:(minX+maxX)/2,y:(minY+maxY)/2,size:Math.max(maxX-minX,maxY-minY)};
+  const minX = Math.min(...t.x);
+  const maxX = Math.max(...t.x);
+  const minY = Math.min(...t.y);
+  const maxY = Math.max(...t.y);
+  center = {
+    x: (minX + maxX) / 2,
+    y: (minY + maxY) / 2,
+    size: Math.max(maxX - minX, maxY - minY)
+  };
+
   addSeabed();
-  addWater(minX,maxX,minY,maxY);
-  const polygons=[...(geometryData.land?.polygons||[]),...(geometryData.islands?.polygons||[])];
-  let rendered=0;
-  for(const polygon of polygons) if(addLandPolygon(polygon)) rendered++;
-  addLines(coastGroup,geometryData.coast,14.2,0x103f4b,130);
-  addLines(eezGroup,geometryData.eez,14.0,0xb57b18,120);
+  addWater(minX, maxX, minY, maxY);
+  const landCount = addLand();
+
+  addLines(coastGroup, geometryData.coast, 15, 0x103f4b, 130);
+  addLines(eezGroup, geometryData.eez, 14.6, 0xb57b18, 120);
+
   fitCamera();
-  status(`3D ocean ready · ${rendered}/${polygons.length} land polygons`);
+  status(`3D ocean ready · ${landCount} land polygons`);
   $('loading')?.classList.add('hide');
 }
 
 function updateDepth() {
-  depthExaggeration=+$('exaggeration')?.value||55;
-  if($('exagValue')) $('exagValue').textContent=`${depthExaggeration}×`;
-  const mesh=seabedGroup.children[0]; if(!mesh) return;
-  const a=mesh.geometry.attributes.position, raw=geometryData.terrain.rawDepthKm;
-  const nx=geometryData.terrain.x.length, ny=geometryData.terrain.y.length;
-  for(let j=0;j<ny;j++) for(let i=0;i<nx;i++) {
-    const v=raw[j][i]; a.setZ(j*nx+i,finite(v)?-v*depthExaggeration:-2);
+  depthExaggeration = +$('exaggeration')?.value || 55;
+  if ($('exagValue')) $('exagValue').textContent = `${depthExaggeration}×`;
+
+  const mesh = seabedGroup.children[0];
+  if (!mesh) return;
+  const a = mesh.geometry.attributes.position;
+  const raw = geometryData.terrain.rawDepthKm;
+  const nx = geometryData.terrain.x.length;
+  const ny = geometryData.terrain.y.length;
+
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const v = raw[j][i];
+      a.setZ(j * nx + i, finite(v) ? -v * depthExaggeration : -2);
+    }
   }
-  a.needsUpdate=true; mesh.geometry.computeVertexNormals();
+  a.needsUpdate = true;
+  mesh.geometry.computeVertexNormals();
 }
 
-$('exaggeration')?.addEventListener('input',updateDepth);
-$('reset')?.addEventListener('click',fitCamera);
-$('fullscreen')?.addEventListener('click',()=>document.documentElement.requestFullscreen?.());
-$('closeReadout')?.addEventListener('click',()=>$('readout')?.classList.remove('show'));
+$('exaggeration')?.addEventListener('input', updateDepth);
+$('reset')?.addEventListener('click', fitCamera);
+$('fullscreen')?.addEventListener('click', () => document.documentElement.requestFullscreen?.());
+$('closeReadout')?.addEventListener('click', () => $('readout')?.classList.remove('show'));
 
-for(const button of document.querySelectorAll('[data-view]')) button.addEventListener('click',()=>{
-  document.querySelectorAll('[data-view]').forEach(b=>b.classList.remove('active'));
-  button.classList.add('active');
-  const d=Math.max(650,center.size*1.5);
-  if(button.dataset.view==='top'){camera.position.set(center.x,center.y,d*.9);controls.target.set(center.x,center.y,0);}
-  else if(button.dataset.view==='under'){camera.position.set(center.x+d*.45,center.y-d*.45,-d*.22);controls.target.set(center.x,center.y,-120);}
-  else if(button.dataset.view==='profile'){camera.position.set(center.x+d*.75,center.y,d*.18);controls.target.set(center.x,center.y,-120);}
-  else fitCamera();
-  controls.update();
+for (const button of document.querySelectorAll('[data-view]')) {
+  button.addEventListener('click', () => {
+    document.querySelectorAll('[data-view]').forEach(b => b.classList.remove('active'));
+    button.classList.add('active');
+    const d = Math.max(650, center.size * 1.5);
+    if (button.dataset.view === 'top') {
+      camera.position.set(center.x, center.y, d * 0.9);
+      controls.target.set(center.x, center.y, 0);
+    } else if (button.dataset.view === 'under') {
+      camera.position.set(center.x + d * 0.45, center.y - d * 0.45, -d * 0.22);
+      controls.target.set(center.x, center.y, -120);
+    } else if (button.dataset.view === 'profile') {
+      camera.position.set(center.x + d * 0.75, center.y, d * 0.18);
+      controls.target.set(center.x, center.y, -120);
+    } else {
+      fitCamera();
+    }
+    controls.update();
+  });
+}
+
+async function init() {
+  try {
+    status('Loading geometry.json…', 'busy');
+    geometryData = await fetch(`geometry.json?${Date.now()}`).then(r => {
+      if (!r.ok) throw Error(`${r.status} ${r.statusText}`);
+      return r.json();
+    });
+    buildScene();
+  } catch (error) {
+    console.error(error);
+    status(`3D geometry failed: ${error.message}`, 'error');
+    $('loading')?.classList.add('hide');
+  }
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
 });
 
-async function init(){
-  try{
-    status('Loading Natural Earth land + GEBCO seabed…','busy');
-    geometryData=await fetch('geometry.json',{cache:'no-store'}).then(r=>{if(!r.ok)throw Error(`${r.status} ${r.statusText}`);return r.json();});
-    buildScene();
-  }catch(error){
-    console.error(error); status(`3D geometry failed: ${error.message}`,'error'); $('loading')?.classList.add('hide');
-  }
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
 }
 
-addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
-function animate(){requestAnimationFrame(animate);controls.update();renderer.render(scene,camera);}
-init(); animate();
+init();
+animate();
