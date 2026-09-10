@@ -1,26 +1,36 @@
-# SolvX — Three.js/WebGL
+# SolvX — Interactive 3D Ocean
 
-This is a replacement for the previous Plotly UI. Python performs geospatial preprocessing; Three.js/WebGL renders the application.
+The original project used Python geospatial preprocessing plus a fullscreen Three.js/WebGL renderer. The integration branch adds the SolvX NetCDF API and turns the viewer into a live interactive ocean-data explorer.
 
-Install:
-`pip install numpy xarray geopandas shapely netcdf4`
+## Run everything
 
-Build:
-`python -m solvx_threejs.build --data-dir /mnt/data --output /mnt/data/solvx_bay_of_bengal.html`
+From the repository root:
 
-The generated HTML is fullscreen-first: the 3D model owns the complete viewport and controls are a small overlay.
+```bash
+pip install -r requirements.txt
+python run.py
+```
 
-Modes:
-1 = 3D overview
-2 = top
-3 = profile
-4 = under-surface
-F = browser fullscreen
-R = reset
+The launcher prepares `frontend/geometry.json`, starts FastAPI on `http://127.0.0.1:8000`, starts the frontend on `http://127.0.0.1:5500`, and opens the browser.
 
-Mouse:
-drag = orbit
-right drag / shift drag = pan
-wheel = zoom
+## Interactive viewer
 
-Three.js is loaded from jsDelivr, so the generated page needs network access.
+- Left panel: variables discovered directly from the NetCDF dataset.
+- Color field: selected variable is rendered over the 3D ocean grid.
+- Depth: depth-dependent variables are rendered as stacked horizontal layers; the depth control highlights a selected layer.
+- Time: the bottom timeline is driven by the dataset `time` coordinate and can play through available timestamps.
+- Hover: move over a colored ocean cell to see the selected variable and depth/range information.
+- Views: 3D, top, profile and under-surface.
+- Vertical exaggeration: preserves the existing bathymetry visualization while making ocean depth visible at screen scale.
+- GEBCO, coastlines, land and EEZ geometry remain separate from the live ocean field so changing variable/time does not rebuild geographic geometry.
+
+## API
+
+- `GET /datasets`
+- `GET /variables/{filename}`
+- `GET /metadata/{filename}`
+- `GET /data/point`
+- `GET /data/region`
+- `GET /data/region/array`
+
+The API reads the existing `data/model/*.nc` files. The region-array endpoint supports a `stride` parameter to keep browser payloads manageable.
