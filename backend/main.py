@@ -1,12 +1,13 @@
 from pathlib import Path
 from typing import Optional
 import numpy as np
+import pandas as pd
 import xarray as xr
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "model"
-app = FastAPI(title="SolvX Ocean Data API", description="API for interactive 3D ocean visualization", version="2.2.2")
+app = FastAPI(title="SolvX Ocean Data API", description="API for interactive 3D ocean visualization", version="2.2.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["GET", "OPTIONS"], allow_headers=["*"])
 
 def get_nc_files(): return sorted(DATA_DIR.glob("*.nc"))
@@ -32,8 +33,49 @@ def sanitize(v):
 def variable_catalog(ds):
     return [{"name": n, "dimensions": list(v.dims), "shape": list(v.shape), "dtype": str(v.dtype), "long_name": v.attrs.get("long_name"), "standard_name": v.attrs.get("standard_name"), "units": v.attrs.get("units")} for n, v in ds.data_vars.items()]
 
+def normalize_time_coordinate(data):
+    """Make time coordinates and API time strings comparable.
+
+    Some NetCDF files expose time as strings while FastAPI receives ISO-8601
+    timestamps. Pandas/xarray then sees a string index and a Timestamp query,
+    which breaks nearest selection. Convert the dataset coordinate to a
+    timezone-naive UTC datetime64 index once before time selection.
+    """
+    if "time" not in data.dims or "time" not in data.coords:
+        return data
+    try:
+        values = pd.to_datetime(data["time"].values, utc=True)
+        if isinstance(values, pd.DatetimeIndex):
+            values = values.tz_localize(None)
+        else:
+            values = pd.DatetimeIndex(values).tz_localize(None)
+        return data.assign_coords(time=("time", values.to_numpy(dtype="datetime64[ns]")))
+    except Exception as e:
+        raise HTTPException(422, detail=f"Could not normalize NetCDF time coordinate: {e}")
+
+def normalize_time_value(value):
+    if value is None: return None
+    try:
+        parsed = pd.to_datetime(value, utc=True)
+        if isinstance(parsed, pd.DatetimeIndex):
+            return parsed.tz_localize(None)
+        if getattr(parsed, "tzinfo", None) is not None:
+            parsed = parsed.tz_convert(None)
+        return parsed
+    except Exception as e:
+        raise HTTPException(422, detail=f"Invalid time value '{value}': {e}")
+
+def select_time(data, value, method="nearest"):
+    if value is None or "time" not in data.dims:
+        return data
+    data = normalize_time_coordinate(data)
+    return data.sel(time=normalize_time_value(value), method=method)
+
 def coord_slice(data, dim, lo, hi):
     if dim not in data.dims or lo is None or hi is None: return data
+    if dim == "time":
+        data = normalize_time_coordinate(data)
+        lo, hi = normalize_time_value(lo), normalize_time_value(hi)
     c = data[dim].values
     if not c.size: return data
     return data.sel({dim: slice(lo, hi) if c[0] <= c[-1] else slice(hi, lo)})
@@ -135,8 +177,8 @@ def ocean_current_grid(time: Optional[str] = None, depth: Optional[float] = None
     with xr.open_dataset(f) as ds:
         u, v = ds[u_name], ds[v_name]
         if time is not None:
-            if "time" in u.dims: u = u.sel(time=time, method="nearest")
-            if "time" in v.dims: v = v.sel(time=time, method="nearest")
+            u = select_time(u, time)
+            v = select_time(v, time)
         if depth is not None:
             if "depth" in u.dims: u = u.sel(depth=depth, method="nearest")
             if "depth" in v.dims: v = v.sel(depth=depth, method="nearest")
@@ -164,13 +206,15 @@ def ocean_point(latitude: float, longitude: float, time: Optional[str] = None):
                     for mf, cn, *_ in matches:
                         if mf != f or cn not in ds.data_vars: continue
                         q = ds[cn]
-                        for dim, val in (("latitude", latitude), ("longitude", longitude), ("lat", latitude), ("lon", longitude), ("time", time)):
+                        for dim, val in (("latitude", latitude), ("longitude", longitude), ("lat", latitude), ("lon", longitude)):
                             if val is not None and dim in q.dims: q = q.sel({dim: val}, method="nearest")
+                        if time is not None: q = select_time(q, time)
                         if q.ndim == 0: values[cn] = sanitize(q.values)
                     result.append({"id": logical, "label": label, "available": True, "units": attrs.get("units"), "value": values, "depth_dependent": "depth" in dims}); continue
                 q = ds[n]
-                for dim, val in (("latitude", latitude), ("longitude", longitude), ("lat", latitude), ("lon", longitude), ("time", time)):
+                for dim, val in (("latitude", latitude), ("longitude", longitude), ("lat", latitude), ("lon", longitude)):
                     if val is not None and dim in q.dims: q = q.sel({dim: val}, method="nearest")
+                if time is not None: q = select_time(q, time)
                 if q.ndim: q = q.isel({d: 0 for d in q.dims})
                 result.append({"id": logical, "label": label, "available": True, "units": attrs.get("units"), "value": sanitize(q.values), "depth_dependent": "depth" in dims})
         except Exception as e: result.append({"id": logical, "label": label, "available": False, "value": None, "error": str(e)})
@@ -181,8 +225,9 @@ def get_point(file: str, variable: str, latitude: Optional[float] = None, longit
     with open_dataset(file) as ds:
         if variable not in ds.data_vars: raise HTTPException(404, detail={"error": f"Variable '{variable}' not found", "available_variables": list(ds.data_vars)})
         data = ds[variable]
-        for dim, value in (("latitude", latitude), ("longitude", longitude), ("depth", depth), ("time", time)):
+        for dim, value in (("latitude", latitude), ("longitude", longitude), ("depth", depth)):
             if value is not None and dim in data.dims: data = data.sel({dim: value}, method="nearest")
+        if time is not None: data = select_time(data, time)
         if data.ndim == 0: return {"variable": variable, "value": sanitize(data.values), "coordinates": {k: sanitize(v.values) for k, v in data.coords.items()}}
         if data.size > 10000: raise HTTPException(413, detail={"error": "Too much data requested", "remaining_dimensions": dict(data.sizes)})
         frame = data.to_dataframe(name=variable).reset_index().replace({np.nan: None})
