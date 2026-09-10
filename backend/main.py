@@ -6,25 +6,20 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "model"
-app = FastAPI(title="SolvX Ocean Data API", description="API for interactive 3D ocean visualization", version="2.2.1")
+app = FastAPI(title="SolvX Ocean Data API", description="API for interactive 3D ocean visualization", version="2.2.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["GET", "OPTIONS"], allow_headers=["*"])
 
-def get_nc_files():
-    return sorted(DATA_DIR.glob("*.nc"))
+def get_nc_files(): return sorted(DATA_DIR.glob("*.nc"))
 
 def find_file(filename: str):
     path = DATA_DIR / Path(filename).name
-    if not path.exists() or path.suffix.lower() != ".nc":
-        raise HTTPException(404, detail=f"NetCDF file not found: {Path(filename).name}")
+    if not path.exists() or path.suffix.lower() != ".nc": raise HTTPException(404, detail=f"NetCDF file not found: {Path(filename).name}")
     return path
 
 def open_dataset(filename: str):
-    try:
-        return xr.open_dataset(find_file(filename))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, detail=f"Could not open NetCDF file: {e}")
+    try: return xr.open_dataset(find_file(filename))
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, detail=f"Could not open NetCDF file: {e}")
 
 def sanitize(v):
     if isinstance(v, np.ndarray): return [sanitize(x) for x in v.tolist()]
@@ -65,10 +60,8 @@ def find_logical(logical):
         try:
             with xr.open_dataset(f) as ds:
                 for n, v in ds.data_vars.items():
-                    if aliases(f.name, n) == logical:
-                        out.append((f, n, dict(v.attrs), list(v.dims), list(v.shape)))
-        except Exception:
-            pass
+                    if aliases(f.name, n) == logical: out.append((f, n, dict(v.attrs), list(v.dims), list(v.shape)))
+        except Exception: pass
     return out
 
 def find_current_components():
@@ -76,8 +69,7 @@ def find_current_components():
     if not matches: return None, None, None
     f = matches[0][0]
     names = [m[1] for m in matches if m[0] == f]
-    def attrs(name):
-        return next((m[2] for m in matches if m[0] == f and m[1] == name), {})
+    def attrs(name): return next((m[2] for m in matches if m[0] == f and m[1] == name), {})
     def pick(direction):
         for n in names:
             s, std = n.lower(), str(attrs(n).get("standard_name", "")).lower()
@@ -94,8 +86,7 @@ def datasets():
     out = []
     for f in get_nc_files():
         try:
-            with xr.open_dataset(f) as ds:
-                out.append({"file": f.name, "variables": variable_catalog(ds), "dimensions": {k: int(v) for k, v in ds.sizes.items()}})
+            with xr.open_dataset(f) as ds: out.append({"file": f.name, "variables": variable_catalog(ds), "dimensions": {k: int(v) for k, v in ds.sizes.items()}})
         except Exception as e: out.append({"file": f.name, "error": str(e)})
     return {"count": len(out), "datasets": out}
 
@@ -119,8 +110,7 @@ def ocean_catalog():
     for logical, label in labels:
         matches = find_logical(logical)
         if not matches:
-            out.append({"id": logical, "label": label, "available": False, "reason": "No matching NetCDF variable found"})
-            continue
+            out.append({"id": logical, "label": label, "available": False, "reason": "No matching NetCDF variable found"}); continue
         f, n, attrs, dims, shape = matches[0]
         out.append({"id": logical, "label": label, "available": True, "file": f.name, "variable": n, "units": attrs.get("units"), "long_name": attrs.get("long_name"), "standard_name": attrs.get("standard_name"), "dimensions": dims, "shape": shape, "matches": [{"file": x[0].name, "variable": x[1], "units": x[2].get("units"), "dimensions": x[3], "shape": x[4]} for x in matches]})
     return {"variables": out}
@@ -129,8 +119,7 @@ def ocean_catalog():
 def ocean_time():
     for f, n, *_ in find_logical("temperature"):
         with xr.open_dataset(f) as ds:
-            if "time" in ds[n].dims and "time" in ds.coords:
-                return {"file": f.name, "variable": n, "count": int(ds.time.size), "values": sanitize(ds.time.values.tolist())}
+            if "time" in ds[n].dims and "time" in ds.coords: return {"file": f.name, "variable": n, "count": int(ds.time.size), "values": sanitize(ds.time.values.tolist())}
     for f in get_nc_files():
         try:
             with xr.open_dataset(f) as ds:
@@ -145,16 +134,20 @@ def ocean_current_grid(time: Optional[str] = None, depth: Optional[float] = None
     stride = max(1, min(stride, 20))
     with xr.open_dataset(f) as ds:
         u, v = ds[u_name], ds[v_name]
-        for da_name in ("u", "v"):
-            da = locals()[da_name]
-            if time is not None and "time" in da.dims: da = da.sel(time=time, method="nearest")
-            if depth is not None and "depth" in da.dims: da = da.sel(depth=depth, method="nearest")
-            locals()[da_name] = da
-        u = u.isel({("latitude" if "latitude" in u.dims else "lat"): slice(None, None, stride), ("longitude" if "longitude" in u.dims else "lon"): slice(None, None, stride)}).squeeze()
-        v = v.isel({("latitude" if "latitude" in v.dims else "lat"): slice(None, None, stride), ("longitude" if "longitude" in v.dims else "lon"): slice(None, None, stride)}).squeeze()
-        lat = u.coords.get("latitude", u.coords.get("lat")); lon = u.coords.get("longitude", u.coords.get("lon"))
+        if time is not None:
+            if "time" in u.dims: u = u.sel(time=time, method="nearest")
+            if "time" in v.dims: v = v.sel(time=time, method="nearest")
+        if depth is not None:
+            if "depth" in u.dims: u = u.sel(depth=depth, method="nearest")
+            if "depth" in v.dims: v = v.sel(depth=depth, method="nearest")
+        ydim = "latitude" if "latitude" in u.dims else "lat" if "lat" in u.dims else None
+        xdim = "longitude" if "longitude" in u.dims else "lon" if "lon" in u.dims else None
+        if not ydim or not xdim: raise HTTPException(422, detail="Current dataset has no latitude/longitude dimensions")
+        u = u.isel({ydim: slice(None, None, stride), xdim: slice(None, None, stride)}).squeeze()
+        v = v.isel({ydim: slice(None, None, stride), xdim: slice(None, None, stride)}).squeeze()
+        lat, lon = u.coords.get(ydim), u.coords.get(xdim)
         if lat is None or lon is None: raise HTTPException(422, detail="Current dataset has no latitude/longitude coordinates")
-        return {"file": f.name, "u_variable": u_name, "v_variable": v_name, "latitude": sanitize(lat.values[::stride]), "longitude": sanitize(lon.values[::stride]), "u": sanitize(np.asarray(u.values, dtype=np.float32)), "v": sanitize(np.asarray(v.values, dtype=np.float32)), "units": u.attrs.get("units") or v.attrs.get("units")}
+        return {"file": f.name, "u_variable": u_name, "v_variable": v_name, "latitude": sanitize(lat.values), "longitude": sanitize(lon.values), "u": sanitize(np.asarray(u.values, dtype=np.float32)), "v": sanitize(np.asarray(v.values, dtype=np.float32)), "units": u.attrs.get("units") or v.attrs.get("units")}
 
 @app.get("/ocean/point")
 def ocean_point(latitude: float, longitude: float, time: Optional[str] = None):
