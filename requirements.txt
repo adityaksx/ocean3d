@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+numpy
+xarray
+geopandas
+shapely
+netcdf4
